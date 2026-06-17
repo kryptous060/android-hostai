@@ -16,6 +16,8 @@ import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Semaphore
 import java.io.PrintWriter
+import kotlinx.coroutines.Job
+
 
 /**
  * Data class to store chat completion information.
@@ -1463,35 +1465,34 @@ class OpenAIApiServer(
         return promptBuilder.toString()
     }
 
-    /**
-     * Handles streaming responses for chat completions.
-     */
-    private suspend fun handleChatStreamingResponse(ctx: JavalinContext, messages: List<Map<String, Any>>) {
-        val prompt = buildContentsFromMessages(messages)
-        
-        ctx.contentType("text/event-stream")
-        
-        // Explicitly define the writer type
-        val writer: java.io.PrintWriter = ctx.res().writer
-        
-        try {
-            // Use the callback format your model expects
-            val job = model.generateStream(prompt) { chunk: String ->
-                val json = gson.toJson(mapOf(
-                    "choices" to listOf(mapOf("delta" to mapOf("content" to chunk)))
-                ))
-                writer.write("data: $json\n\n")
-                writer.flush()
-            }
-            
-            // Wait for generation to complete
-            job?.join()
-            
-            writer.write("data: [DONE]\n\n")
-            writer.flush()
-        } catch (e: Exception) {
-            LogManager.e("OpenAIApiServer", "Error during streaming response", e)
-        }
+// Keep your existing imports at the top of the file. 
+// Do NOT change those.
+
+// Inside your class, find your 'handleChatStreamingResponse' function:
+private suspend fun handleChatStreamingResponse(ctx: JavalinContext, messages: List<Map<String, Any>>) {
+    val prompt = buildContentsFromMessages(messages)
     
+    ctx.contentType("text/event-stream")
+    val writer: java.io.PrintWriter = ctx.res().writer
+    
+    try {
+        // --- THIS IS THE PART YOU NEED TO PASTE ---
+        // Explicitly declaring 'val job: Job?' fixes the unresolved reference error
+        val job: kotlinx.coroutines.Job? = model.generateStream(prompt) { chunk: String ->
+            val json = gson.toJson(mapOf(
+                "choices" to listOf(mapOf("delta" to mapOf("content" to chunk)))
+            ))
+            writer.write("data: $json\n\n")
+            writer.flush()
+        }
+        
+        // This line now works because the compiler knows 'job' is a Job
+        job?.join()
+        // ------------------------------------------
+        
+        writer.write("data: [DONE]\n\n")
+        writer.flush()
+    } catch (e: Exception) {
+        LogManager.e("OpenAIApiServer", "Error during streaming response", e)
     }
 }
