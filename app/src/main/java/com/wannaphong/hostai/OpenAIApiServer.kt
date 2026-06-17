@@ -487,5 +487,6 @@ class OpenAIApiServer(
                     contentElement.isJsonPrimitive && contentElement.asJsonPrimitive.isString -> {
                         contentElement.asString
                     }
+                    }
                     contentElement.isJsonArray -> {
                         // Store multimodal content as a list of maps 
