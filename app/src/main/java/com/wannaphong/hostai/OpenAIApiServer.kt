@@ -475,6 +475,7 @@ class OpenAIApiServer(
         val created = System.currentTimeMillis() / 1000
         
         // Store completion if store parameter is true
+        // Store completion if store parameter is true
         if (store) {
             val messagesList = messages.map { element ->
                 val msgObj = element.asJsonObject
@@ -487,6 +488,52 @@ class OpenAIApiServer(
                     contentElement.isJsonPrimitive && contentElement.asJsonPrimitive.isString -> {
                         contentElement.asString
                     }
-                    }
                     contentElement.isJsonArray -> {
-                        // Store multimodal content as a list of maps 
+                        gson.fromJson(contentElement, object : TypeToken<List<Map<String, Any>>>() {}.type)
+                    }
+                    else -> contentElement.toString()
+                }
+                
+                mapOf("role" to role, "content" to content)
+            }
+            
+            val storedCompletion = StoredCompletion(
+                id = id,
+                obj = "chat.completion",
+                created = created,
+                model = model.getModelName(),
+                messages = messagesList,
+                responseContent = completion,
+                metadata = metadata
+            )
+            storedCompletions[id] = storedCompletion
+            LogManager.d(TAG, "Stored chat completion: $id")
+        }
+        
+        val response = mapOf(
+            "id" to id,
+            "object" to "chat.completion",
+            "created" to created,
+            "model" to model.getModelName(),
+            "choices" to listOf(
+                mapOf(
+                    "index" to 0,
+                    "message" to mapOf(
+                        "role" to "assistant",
+                        "content" to completion
+                    ),
+                    "finish_reason" to "stop"
+                )
+            ),
+            "usage" to mapOf(
+                "prompt_tokens" to promptTokens,
+                "completion_tokens" to completionTokens,
+                "total_tokens" to (promptTokens + completionTokens)
+            )
+        )
+        
+        val responseBody = gson.toJson(response)
+        logRequestIfEnabled(ctx, "/v1/chat/completions", bodyText, responseBody)
+        ctx.contentType("application/json").result(responseBody)
+    }
+}
