@@ -15,6 +15,7 @@ import org.eclipse.jetty.util.thread.QueuedThreadPool
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Semaphore
+import java.io.PrintWriter
 
 /**
  * Data class to store chat completion information.
@@ -1471,17 +1472,18 @@ class OpenAIApiServer(
     /**
      * Handles streaming responses for chat completions.
      */
-        private suspend fun handleChatStreamingResponse(ctx: JavalinContext, messages: List<Map<String, Any>>) {
+    private suspend fun handleChatStreamingResponse(ctx: JavalinContext, messages: List<Map<String, Any>>) {
         val contents = buildContentsFromMessages(messages)
         val flow = model.generateStream(contents)
         
         ctx.res().contentType = "text/event-stream"
         
-        // Explicitly define the writer type to resolve 'Unresolved reference' errors
-        val writer: java.io.PrintWriter = ctx.res().writer
+        // Use the explicit PrintWriter type
+        val writer: PrintWriter = ctx.res().writer
         
         try {
-            flow.collect { chunk ->
+            // Explicitly typing 'chunk: String' fixes the "Cannot infer type" error
+            flow.collect { chunk: String ->
                 val json = gson.toJson(mapOf(
                     "choices" to listOf(mapOf("delta" to mapOf("content" to chunk)))
                 ))
@@ -1491,7 +1493,6 @@ class OpenAIApiServer(
             writer.write("data: [DONE]\n\n")
             writer.flush()
         } catch (e: Exception) {
-            // Log the error locally if streaming fails
             LogManager.e("OpenAIApiServer", "Error during streaming response", e)
         }
     }
