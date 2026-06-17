@@ -1455,35 +1455,34 @@ class OpenAIApiServer(
     /**
      * Helper to map OpenAI-style messages into a standard prompt string.
      */
-    private fun buildContentsFromMessages(messages: List<Map<String, Any>>): String {
-        val promptBuilder = StringBuilder()
-        for (msg in messages) {
-            val role = msg["role"] as? String ?: "user"
-            val text = msg["content"] as? String ?: ""
-            promptBuilder.append("$role: $text\n")
-        }
-        return promptBuilder.toString()
-    }
-
     private suspend fun handleChatStreamingResponse(ctx: JavalinContext, messages: List<Map<String, Any>>) {
-        val prompt = buildContentsFromMessages(messages)
-        
-        ctx.contentType("text/event-stream")
-        val writer: java.io.PrintWriter = ctx.res().writer
-        
         try {
-            val job: kotlinx.coroutines.Job? = model.generateStream(prompt) { chunk: String ->
-                val json = gson.toJson(mapOf(
-                    "choices" to listOf(mapOf("delta" to mapOf("content" to chunk)))
-                ))
-                writer.write("data: $json\n\n")
-                writer.flush()
-            }
+            val prompt = buildContentsFromMessages(messages)
             
+            ctx.contentType("text/event-stream")
+            val writer: java.io.PrintWriter = ctx.res().writer
+            
+            // Explicitly named arguments resolve the overload ambiguity error
+            val job: kotlinx.coroutines.Job? = model.generateStream(
+                prompt = prompt,
+                maxTokens = 100, 
+                temperature = 0.7f,
+                onToken = { chunk: String ->
+                    val json = gson.toJson(mapOf(
+                        "choices" to listOf(mapOf("delta" to mapOf("content" to chunk)))
+                    ))
+                    writer.write("data: $json\n\n")
+                    writer.flush()
+                }
+            )
+            
+            // Ensure the streaming job completes
             job?.join()
             
+            // Signal the end of the stream
             writer.write("data: [DONE]\n\n")
             writer.flush()
+            
         } catch (e: Exception) {
             LogManager.e("OpenAIApiServer", "Error during streaming response", e)
         } 
