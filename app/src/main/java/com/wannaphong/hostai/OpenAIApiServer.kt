@@ -1465,34 +1465,27 @@ class OpenAIApiServer(
         return promptBuilder.toString()
     }
 
-// Keep your existing imports at the top of the file. 
-// Do NOT change those.
-
-// Inside your class, find your 'handleChatStreamingResponse' function:
-private suspend fun handleChatStreamingResponse(ctx: JavalinContext, messages: List<Map<String, Any>>) {
-    val prompt = buildContentsFromMessages(messages)
-    
-    ctx.contentType("text/event-stream")
-    val writer: java.io.PrintWriter = ctx.res().writer
-    
-    try {
-        // --- THIS IS THE PART YOU NEED TO PASTE ---
-        // Explicitly declaring 'val job: Job?' fixes the unresolved reference error
-        val job: kotlinx.coroutines.Job? = model.generateStream(prompt) { chunk: String ->
-            val json = gson.toJson(mapOf(
-                "choices" to listOf(mapOf("delta" to mapOf("content" to chunk)))
-            ))
-            writer.write("data: $json\n\n")
+    private suspend fun handleChatStreamingResponse(ctx: JavalinContext, messages: List<Map<String, Any>>) {
+        val prompt = buildContentsFromMessages(messages)
+        
+        ctx.contentType("text/event-stream")
+        val writer: java.io.PrintWriter = ctx.res().writer
+        
+        try {
+            val job: kotlinx.coroutines.Job? = model.generateStream(prompt) { chunk: String ->
+                val json = gson.toJson(mapOf(
+                    "choices" to listOf(mapOf("delta" to mapOf("content" to chunk)))
+                ))
+                writer.write("data: $json\n\n")
+                writer.flush()
+            }
+            
+            job?.join()
+            
+            writer.write("data: [DONE]\n\n")
             writer.flush()
-        }
-        
-        // This line now works because the compiler knows 'job' is a Job
-        job?.join()
-        // ------------------------------------------
-        
-        writer.write("data: [DONE]\n\n")
-        writer.flush()
-    } catch (e: Exception) {
-        LogManager.e("OpenAIApiServer", "Error during streaming response", e)
+        } catch (e: Exception) {
+            LogManager.e("OpenAIApiServer", "Error during streaming response", e)
+        } 
     }
 }
