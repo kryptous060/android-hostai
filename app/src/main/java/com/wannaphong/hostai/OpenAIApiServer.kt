@@ -1453,43 +1453,36 @@ class OpenAIApiServer(
     /**
      * Helper to map OpenAI-style messages to Llama model content format.
      */
-    private fun buildContentsFromMessages(messages: List<Map<String, Any>>): List<Content> {
-        return messages.map { msg ->
+    private fun buildContentsFromMessages(messages: List<Map<String, Any>>): String {
+        val promptBuilder = java.lang.StringBuilder()
+        for (msg in messages) {
             val role = msg["role"] as? String ?: "user"
-            val contentValue = msg["content"]
-            
-            val text = when (contentValue) {
-                is String -> contentValue
-                is List<*> -> contentValue.filterIsInstance<Map<String, Any>>()
-                    .joinToString("\n") { it["text"] as? String ?: "" }
-                else -> ""
-            }
-            
-            Content.Builder().setRole(role).setText(text).build()
+            val text = msg["content"] as? String ?: ""
+            promptBuilder.append("$role: $text\n")
         }
+        return promptBuilder.toString()
     }
 
-    /**
-     * Handles streaming responses for chat completions.
-     */
     private suspend fun handleChatStreamingResponse(ctx: JavalinContext, messages: List<Map<String, Any>>) {
-        val contents = buildContentsFromMessages(messages)
-        val flow = model.generateStream(contents)
+        val prompt = buildContentsFromMessages(messages)
         
-        ctx.res().contentType = "text/event-stream"
-        
-        // Use the explicit PrintWriter type
-        val writer: PrintWriter = ctx.res().writer
+        // Use standard Javalin syntax for the content type
+        ctx.contentType("text/event-stream")
+        val writer: java.io.PrintWriter = ctx.res().writer
         
         try {
-            // Explicitly typing 'chunk: String' fixes the "Cannot infer type" error
-            flow.collect { chunk: String ->
+            // Use the callback format that your LlamaModel expects
+            val job = model.generateStream(prompt) { chunk: String ->
                 val json = gson.toJson(mapOf(
                     "choices" to listOf(mapOf("delta" to mapOf("content" to chunk)))
                 ))
                 writer.write("data: $json\n\n")
                 writer.flush()
             }
+            
+            // Wait for the stream job to finish
+            job?.join()
+            
             writer.write("data: [DONE]\n\n")
             writer.flush()
         } catch (e: Exception) {
