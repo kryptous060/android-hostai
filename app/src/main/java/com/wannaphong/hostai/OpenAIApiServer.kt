@@ -1468,9 +1468,13 @@ class OpenAIApiServer(
                 maxTokens = 100, 
                 temperature = 0.7f,
                 onToken = { chunk: String ->
-                    val json = gson.toJson(mapOf(
+                    // Build the JSON map inside the callback
+                    val jsonMap = mapOf(
                         "choices" to listOf(mapOf("delta" to mapOf("content" to chunk)))
-                    ))
+                    )
+                    val json = gson.toJson(jsonMap)
+                    
+                    // Use writer to send the event
                     writer.write("data: $json\n\n")
                     writer.flush()
                 }
@@ -1485,6 +1489,6 @@ class OpenAIApiServer(
             
         } catch (e: Exception) {
             LogManager.e("OpenAIApiServer", "Error during streaming response", e)
-        } 
+        }
     }
 }
