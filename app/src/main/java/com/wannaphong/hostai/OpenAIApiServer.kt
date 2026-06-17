@@ -83,7 +83,7 @@ class OpenAIApiServer(
     
     fun start() {
         try {
-                        io.javalin.util.ConcurrencyUtil.useLoom = false
+            io.javalin.util.ConcurrencyUtil.useLoom = false
             
             // Initialise the semaphore with the current max-concurrency setting.
             val maxConcurrency = settingsManager.getMaxConcurrency()
