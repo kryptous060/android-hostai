@@ -1,0 +1,1491 @@
+package com.wannaphong.hostai
+
+import android.content.Context
+import android.util.Base64
+import com.google.ai.edge.litertlm.Content
+import com.google.gson.Gson
+import com.google.gson.GsonBuilder
+import com.google.gson.JsonObject
+import com.google.gson.reflect.TypeToken
+import io.javalin.Javalin
+import io.javalin.http.Context as JavalinContext
+import kotlinx.coroutines.*
+import org.eclipse.jetty.server.Server
+import org.eclipse.jetty.util.thread.QueuedThreadPool
+import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Semaphore
+
+/**
+ * Data class to store chat completion information.
+ * Messages are stored as Map<String, Any> to support multimodal content.
+ * Content can be either String (simple text) or List (multimodal content parts).
+ */
+data class StoredCompletion(
+    val id: String,
+    val obj: String,
+    val created: Long,
+    val model: String,
+    val messages: List<Map<String, Any>>,
+    val responseContent: String,
+    var metadata: Map<String, Any>?
+)
+
+/**
+ * OpenAI-compatible API server implementation using Javalin.
+ * Implements the following endpoints:
+ * - POST /v1/chat/completions - Chat completions (OpenAI format)
+ * - POST /v1/completions - Text completions (OpenAI format)
+ * - GET /v1/models - List available models
+ * - GET /chat - Chat UI interface
+ */
+class OpenAIApiServer(
+    private val port: Int,
+    private val model: LlamaModel,
+    private val context: Context
+) {
+    
+    private val gson = GsonBuilder()
+        .disableHtmlEscaping()
+        .create()
+    
+    // Coroutine scope for streaming responses
+    private val serverScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    private var app: Javalin? = null
+    
+    // Storage for chat completions with store=true
+    private val storedCompletions = ConcurrentHashMap<String, StoredCompletion>()
+    
+    // Settings manager for feature toggles
+    private val settingsManager = SettingsManager(context)
+    
+    // Semaphore to limit concurrent model-inference requests.
+    // Initialised in start() from the configured max-concurrency value.
+    // fair=true ensures requests are queued in FIFO order (OpenAI-like behaviour).
+    private var requestSemaphore = Semaphore(SettingsManager.DEFAULT_MAX_CONCURRENCY, true)
+    
+    // Request logger (singleton)
+    private val requestLogger by lazy { RequestLogger.getInstance(context) }
+    
+    companion object {
+        private const val TAG = "OpenAIApiServer"
+        // Maximum request body size (10 MB) to prevent memory exhaustion attacks
+        private const val MAX_REQUEST_BODY_SIZE = 10 * 1024 * 1024
+
+        // Jetty thread-pool tuning: keep a small number of threads warm so that
+        // the very first request (and requests after a quiet period) do not incur
+        // thread-creation latency on Android.
+        private const val JETTY_MIN_THREADS = 4
+        private const val JETTY_MAX_THREADS = 20
+        private const val JETTY_IDLE_TIMEOUT_MS = 60_000
+    }
+    
+    fun start() {
+        try {
+            // Initialise the semaphore with the current max-concurrency setting.
+            val maxConcurrency = settingsManager.getMaxConcurrency()
+                .coerceAtLeast(1)
+            requestSemaphore = Semaphore(maxConcurrency, true)
+            LogManager.i(TAG, "Max concurrency set to $maxConcurrency")
+
+            // Pre-warm a small pool of Jetty worker threads so that the first
+            // request (and requests after idle periods) do not pay the cost of
+            // thread creation on Android.  This is the primary fix for the
+            // 5-10 second latency seen when the server appears "slow to start".
+            val threadPool = QueuedThreadPool(JETTY_MAX_THREADS, JETTY_MIN_THREADS, JETTY_IDLE_TIMEOUT_MS)
+            threadPool.isDaemon = true
+            threadPool.name = "hostai-jetty"
+            
+            app = Javalin.create { config ->
+                // Configure Javalin
+                config.maxRequestSize = MAX_REQUEST_BODY_SIZE.toLong()
+                config.showJavalinBanner = false
+            }.apply {
+                // Health check
+                get("/health") { ctx -> handleHealth(ctx) }
+                
+                // Model endpoints
+                get("/v1/models") { ctx -> handleModels(ctx) }
+                
+                // Completion endpoints
+                post("/v1/chat/completions") { ctx -> handleChatCompletions(ctx) }
+                post("/v1/completions") { ctx -> handleCompletions(ctx) }
+                
+                // Stored chat completions endpoints
+                get("/v1/chat/completions/{completion_id}") { ctx -> handleGetStoredCompletion(ctx) }
+                get("/v1/chat/completions/{completion_id}/messages") { ctx -> handleGetStoredCompletionMessages(ctx) }
+                post("/v1/chat/completions/{completion_id}") { ctx -> handleUpdateStoredCompletion(ctx) }
+                
+                // UI endpoints
+                get("/") { ctx -> handleRoot(ctx) }
+                get("/chat") { ctx -> handleChatUI(ctx) }
+                get("/assets/{fileName}") { ctx -> handleAssets(ctx) }
+                
+                // Exception handler
+                exception(Exception::class.java) { e, ctx ->
+                    LogManager.e(TAG, "Error handling request", e)
+                    val errorResponse = mapOf(
+                        "error" to mapOf("message" to (e.message ?: "Internal server error"))
+                    )
+                    ctx.status(500).contentType("application/json").result(gson.toJson(errorResponse))
+                }
+            }.start(port)
+            
+            LogManager.i(TAG, "Javalin server started on port $port")
+        } catch (e: Exception) {
+            LogManager.e(TAG, "Failed to start Javalin server", e)
+            throw e
+        }
+    }
+    
+    fun stop() {
+        try {
+            app?.stop()
+            serverScope.cancel() // Cancel all streaming coroutines
+            LogManager.i(TAG, "Javalin server stopped")
+        } catch (e: Exception) {
+            LogManager.e(TAG, "Error stopping server", e)
+        }
+    }
+    
+    /**
+     * Check if an endpoint is enabled and return error if not
+     */
+    private fun checkEndpointEnabled(ctx: JavalinContext, endpointName: String, isEnabled: Boolean): Boolean {
+        if (!isEnabled) {
+            val errorResponse = mapOf(
+                "error" to mapOf("message" to "$endpointName endpoint is disabled in settings")
+            )
+            ctx.status(403).contentType("application/json").result(gson.toJson(errorResponse))
+            LogManager.w(TAG, "$endpointName endpoint accessed but is disabled")
+            return false
+        }
+        return true
+    }
+    
+    /**
+     * Log request if logging is enabled
+     */
+    private fun logRequestIfEnabled(
+        ctx: JavalinContext,
+        endpoint: String,
+        requestBody: String,
+        responseBody: String
+    ) {
+        if (settingsManager.isLoggingEnabled()) {
+            val ipAddress = ctx.ip()
+            requestLogger.logRequest(ipAddress, endpoint, requestBody, responseBody)
+        }
+    }
+    
+    /**
+     * Get all stored completions
+     */
+    fun getStoredCompletions(): List<StoredCompletion> {
+        return storedCompletions.values.toList().sortedByDescending { it.created }
+    }
+    
+    /**
+     * Get a specific stored completion by ID
+     */
+    fun getStoredCompletionById(id: String): StoredCompletion? {
+        return storedCompletions[id]
+    }
+    
+    /**
+     * Clear all stored completions
+     */
+    fun clearAllStoredCompletions(): Int {
+        val count = storedCompletions.size
+        storedCompletions.clear()
+        LogManager.i(TAG, "Cleared $count stored completions")
+        return count
+    }
+    
+    /**
+     * Delete a specific stored completion
+     */
+    fun deleteStoredCompletion(id: String): Boolean {
+        val removed = storedCompletions.remove(id)
+        if (removed != null) {
+            LogManager.i(TAG, "Deleted stored completion: $id")
+            return true
+        }
+        return false
+    }
+    
+    private fun handleHealth(ctx: JavalinContext) {
+        LogManager.d(TAG, "Handling /health")
+        
+        val health = mapOf(
+            "status" to "ok",
+            "model_loaded" to model.isModelLoaded()
+        )
+        
+        ctx.contentType("application/json").result(gson.toJson(health))
+    }
+    
+    private fun handleModels(ctx: JavalinContext) {
+        LogManager.d(TAG, "Handling /v1/models")
+        
+        val models = mapOf(
+            "object" to "list",
+            "data" to listOf(
+                mapOf(
+                    "id" to model.getModelName(),
+                    "object" to "model",
+                    "created" to System.currentTimeMillis() / 1000,
+                    "owned_by" to "hostai"
+                )
+            )
+        )
+        
+        ctx.contentType("application/json").result(gson.toJson(models))
+    }
+    
+    private fun handleRoot(ctx: JavalinContext) {
+        LogManager.d(TAG, "Handling /")
+        
+        val html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>HostAI - OpenAI Compatible API</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; }
+                    h1 { color: #6200EE; }
+                    .endpoint { background: #f5f5f5; padding: 10px; margin: 10px 0; border-radius: 5px; }
+                    .chat-link { background: #6200EE; color: white; padding: 15px 20px; display: inline-block; margin: 20px 0; text-decoration: none; border-radius: 5px; font-weight: bold; }
+                    .chat-link:hover { background: #3700B3; }
+                </style>
+            </head>
+            <body>
+                <h1>HostAI - OpenAI Compatible API Server</h1>
+                <p>Server is running on port $port</p>
+                <a href="/chat" class="chat-link">Open Chat UI</a>
+                <h2>Available Endpoints:</h2>
+                <div class="endpoint">
+                    <strong>GET /v1/models</strong><br>
+                    List available models
+                </div>
+                <div class="endpoint">
+                    <strong>POST /v1/chat/completions</strong><br>
+                    Chat completion endpoint (OpenAI compatible)<br>
+                    <em>Set store=true to persist completion for later retrieval</em>
+                </div>
+                <div class="endpoint">
+                    <strong>GET /v1/chat/completions/{completion_id}</strong><br>
+                    Get a stored chat completion (only for completions with store=true)
+                </div>
+                <div class="endpoint">
+                    <strong>GET /v1/chat/completions/{completion_id}/messages</strong><br>
+                    Get messages from a stored chat completion
+                </div>
+                <div class="endpoint">
+                    <strong>POST /v1/chat/completions/{completion_id}</strong><br>
+                    Update metadata for a stored chat completion
+                </div>
+                <div class="endpoint">
+                    <strong>POST /v1/completions</strong><br>
+                    Text completion endpoint (OpenAI compatible)
+                </div>
+                <div class="endpoint">
+                    <strong>GET /health</strong><br>
+                    Health check endpoint
+                </div>
+                <div class="endpoint">
+                    <strong>GET /chat</strong><br>
+                    Web-based chat interface
+                </div>
+            </body>
+            </html>
+        """.trimIndent()
+        
+        ctx.html(html)
+    }
+    
+    private fun handleChatUI(ctx: JavalinContext) {
+        LogManager.d(TAG, "Handling /chat")
+        
+        // Check if web chat UI is enabled
+        if (!checkEndpointEnabled(ctx, "Web Chat UI", settingsManager.isWebChatEnabled())) {
+            return
+        }
+        
+        try {
+            val inputStream = context.assets.open("index.html")
+            val html = inputStream.bufferedReader().use { it.readText() }
+            ctx.html(html)
+        } catch (e: Exception) {
+            LogManager.e(TAG, "Error loading chat UI", e)
+            ctx.status(500).html(
+                "<html><body><h1>Error loading chat UI</h1><p>${e.message}</p></body></html>"
+            )
+        }
+    }
+    
+    private fun handleAssets(ctx: JavalinContext) {
+        val fileName = ctx.pathParam("fileName")
+        LogManager.d(TAG, "Handling /assets/$fileName")
+        
+        try {
+            // Security: Prevent path traversal attacks
+            if (fileName.contains("..") || fileName.startsWith("/") || fileName.contains("\\")) {
+                LogManager.w(TAG, "Rejected potential path traversal attempt: $fileName")
+                ctx.status(403).result("Invalid asset path")
+                return
+            }
+            
+            // Determine MIME type based on file extension
+            val mimeType = when {
+                fileName.endsWith(".ico") -> "image/x-icon"
+                fileName.endsWith(".json") -> "application/json"
+                fileName.endsWith(".html") -> "text/html"
+                fileName.endsWith(".css") -> "text/css"
+                fileName.endsWith(".js") -> "application/javascript"
+                else -> "application/octet-stream"
+            }
+            
+            val inputStream = context.assets.open(fileName)
+            val bytes = inputStream.readBytes()
+            inputStream.close()
+            
+            ctx.contentType(mimeType).result(bytes)
+        } catch (e: Exception) {
+            LogManager.e(TAG, "Error loading asset: $fileName", e)
+            ctx.status(404).result("Asset not found")
+        }
+    }
+    
+    private fun handleChatCompletions(ctx: JavalinContext) {
+        LogManager.d(TAG, "Handling /v1/chat/completions")
+        
+        // Check if chat completions endpoint is enabled
+        if (!checkEndpointEnabled(ctx, "Chat Completions", settingsManager.isChatCompletionsEnabled())) {
+            return
+        }
+        
+        try {
+            val bodyText = ctx.body()
+            
+            // Security: Check content length
+            if (bodyText.length > MAX_REQUEST_BODY_SIZE) {
+                LogManager.w(TAG, "Request body too large: ${bodyText.length} bytes")
+                val errorResponse = mapOf(
+                    "error" to mapOf("message" to "Request body too large")
+                )
+                ctx.status(413).contentType("application/json").result(gson.toJson(errorResponse))
+                return
+            }
+            
+            val request = gson.fromJson(bodyText, JsonObject::class.java)
+            
+            LogManager.i(TAG, "Chat completion request received")
+            
+            // Extract parameters
+            val messages = request.getAsJsonArray("messages")
+            val stream = request.get("stream")?.asBoolean ?: false
+            val store = request.get("store")?.asBoolean ?: false
+            val metadata = parseMetadata(request.get("metadata")?.asJsonObject)
+            
+            // Extract session ID using helper method
+            val sessionId = extractSessionId(ctx, request)
+            
+            LogManager.d(TAG, "Using session ID: $sessionId, store: $store")
+            
+            // Build generation config from request parameters
+            val config = extractGenerationConfig(request)
+            
+            // Build content from messages (either String prompt or List<Content> for multimodal)
+            val contents = buildContentsFromMessages(messages)
+            
+            // Log preview
+            if (contents is String) {
+                val promptPreview = if (contents.length > 100) contents.take(100) + "..." else contents
+                LogManager.d(TAG, "Prompt preview: $promptPreview")
+            } else {
+                LogManager.d(TAG, "Multimodal content with ${(contents as List<*>).size} parts")
+            }
+            LogManager.d(TAG, "Chat completion - stream: $stream, maxTokens: ${config.maxTokens}, temp: ${config.temperature}")
+            
+            // Acquire a permit before running inference. If max concurrency is reached the
+            // calling thread blocks here until a permit becomes available (FIFO queue).
+            LogManager.d(TAG, "Acquiring concurrency permit (available: ${requestSemaphore.availablePermits()}, queue depth: ${requestSemaphore.queueLength})")
+            requestSemaphore.acquire()
+            LogManager.d(TAG, "Concurrency permit acquired for chat completion")
+            try {
+                if (stream) {
+                    handleChatStreamingResponse(ctx, contents, config, sessionId, messages, store, metadata, bodyText)
+                } else {
+                    handleChatNonStreamingResponse(ctx, contents, config, sessionId, messages, store, metadata, bodyText)
+                }
+            } finally {
+                requestSemaphore.release()
+            }
+        } catch (e: Exception) {
+            LogManager.e(TAG, "Error handling chat completions", e)
+            val errorResponse = mapOf(
+                "error" to mapOf("message" to (e.message ?: "Internal server error"))
+            )
+            ctx.status(500).contentType("application/json").result(gson.toJson(errorResponse))
+        }
+    }
+    
+    private fun handleChatNonStreamingResponse(
+        ctx: JavalinContext,
+        contents: Any,  // Either String or List<Content>
+        config: GenerationConfig,
+        sessionId: String,
+        messages: com.google.gson.JsonArray,
+        store: Boolean,
+        metadata: Map<String, Any>?,
+        bodyText: String
+    ) {
+        // Generate response with session ID - handle both String and multimodal content
+        val completion = if (contents is String) {
+            model.generate(contents, config, sessionId)
+        } else {
+            @Suppress("UNCHECKED_CAST")
+            model.generateWithContents(contents as List<Content>, config, sessionId)
+        }
+        
+        val promptTokens = when (contents) {
+            is String -> contents.split(" ").size
+            else -> {
+                // Estimate tokens for multimodal content
+                // Count text parts + fixed cost per image/audio
+                @Suppress("UNCHECKED_CAST")
+                val contentList = contents as List<Content>
+                contentList.sumOf { content ->
+                    when (content) {
+                        is Content.Text -> content.toString().split(" ").size
+                        is Content.ImageBytes -> 85  // Typical image token cost (based on OpenAI's 85 tokens per low-detail image)
+                        is Content.AudioBytes -> 50  // Estimate for audio
+                        else -> 10
+                    }
+                }
+            }
+        }
+        val completionTokens = completion.split(" ").size
+        
+        val id = "chatcmpl-${System.currentTimeMillis()}"
+        val created = System.currentTimeMillis() / 1000
+        
+        // Store completion if store parameter is true
+        if (store) {
+            val messagesList = messages.map { element ->
+                val msgObj = element.asJsonObject
+                val role = msgObj.get("role")?.asString ?: ""
+                val contentElement = msgObj.get("content")
+                
+                // Preserve the original content structure (string or array for multimodal)
+                val content: Any = when {
+                    contentElement == null -> ""
+                    contentElement.isJsonPrimitive && contentElement.asJsonPrimitive.isString -> {
+                        contentElement.asString
+                    }
+                    contentElement.isJsonArray -> {
+                        // Store multimodal content as a list of maps using TypeToken for type safety
+                        val mapType = object : TypeToken<Map<String, Any>>() {}.type
+                        contentElement.asJsonArray.map { part ->
+                            gson.fromJson<Map<String, Any>>(part, mapType)
+                        }
+                    }
+                    else -> contentElement.toString()
+                }
+                
+                mapOf(
+                    "role" to role,
+                    "content" to content
+                )
+            }
+            
+            val storedCompletion = StoredCompletion(
+                id = id,
+                obj = "chat.completion",
+                created = created,
+                model = model.getModelName(),
+                messages = messagesList,
+                responseContent = completion,
+                metadata = metadata
+            )
+            
+            storedCompletions[id] = storedCompletion
+            LogManager.i(TAG, "Stored completion with ID: $id")
+        }
+        
+        val response = mapOf(
+            "id" to id,
+            "object" to "chat.completion",
+            "created" to created,
+            "model" to model.getModelName(),
+            "choices" to listOf(
+                mapOf(
+                    "index" to 0,
+                    "message" to mapOf(
+                        "role" to "assistant",
+                        "content" to completion
+                    ),
+                    "finish_reason" to "stop"
+                )
+            ),
+            "usage" to mapOf(
+                "prompt_tokens" to promptTokens,
+                "completion_tokens" to completionTokens,
+                "total_tokens" to (promptTokens + completionTokens)
+            )
+        )
+        
+        LogManager.i(TAG, "Chat completion completed successfully for session: $sessionId")
+        
+        val responseJson = gson.toJson(response)
+        
+        // Log request if logging is enabled
+        logRequestIfEnabled(ctx, "/v1/chat/completions", bodyText, responseJson)
+        
+        ctx.contentType("application/json").result(responseJson)
+    }
+    
+    private fun handleChatStreamingResponse(
+        ctx: JavalinContext,
+        contents: Any,  // Either String or List<Content>
+        config: GenerationConfig,
+        sessionId: String,
+        messages: com.google.gson.JsonArray,
+        store: Boolean,
+        metadata: Map<String, Any>?,
+        bodyText: String
+    ) {
+        LogManager.i(TAG, "Starting chat streaming response for session: $sessionId")
+        
+        // Note: Storing streaming completions is not supported in this implementation
+        // as it requires buffering the entire response before streaming
+        if (store) {
+            LogManager.w(TAG, "Store parameter is not supported with streaming responses")
+        }
+        
+        val id = "chatcmpl-${System.currentTimeMillis()}"
+        val created = System.currentTimeMillis() / 1000
+        
+        // Use Javalin's SSE support for streaming
+        ctx.contentType("text/event-stream")
+        ctx.header("Cache-Control", "no-cache")
+        ctx.header("Connection", "keep-alive")
+        
+        // Get the response output stream
+        val outputStream = ctx.res.getOutputStream()
+        
+        // Accumulate response for logging (using StringBuffer for thread safety)
+        val accumulatedResponse = StringBuffer()
+        
+        try {
+            var tokenCount = 0
+            
+            val job = if (contents is String) {
+                model.generateStream(contents, config, sessionId) { token ->
+                    try {
+                        tokenCount++
+                        
+                        // Accumulate token for logging
+                        accumulatedResponse.append(token)
+                        
+                        // Format according to OpenAI SSE format for chat
+                        val chunk = mapOf(
+                            "id" to id,
+                            "object" to "chat.completion.chunk",
+                            "created" to created,
+                            "model" to model.getModelName(),
+                            "choices" to listOf(
+                                mapOf(
+                                    "index" to 0,
+                                "delta" to mapOf(
+                                    "content" to token
+                                ),
+                                "finish_reason" to null
+                            )
+                        )
+                    )
+                    
+                    // Write SSE format: "data: {json}\n\n"
+                    val sseData = "data: ${gson.toJson(chunk)}\n\n"
+                    outputStream.write(sseData.toByteArray(Charsets.UTF_8))
+                    outputStream.flush()
+                    
+                    LogManager.d(TAG, "Streamed token $tokenCount")
+                } catch (e: IOException) {
+                    // Client disconnected - stop streaming gracefully
+                    LogManager.d(TAG, "Client disconnected during streaming (token $tokenCount)")
+                    throw e
+                } catch (e: Exception) {
+                    LogManager.e(TAG, "Error writing token to stream", e)
+                    throw e
+                }
+            }
+            } else {
+                // Multimodal streaming
+                @Suppress("UNCHECKED_CAST")
+                model.generateStreamWithContents(contents as List<Content>, config, sessionId) { token ->
+                    try {
+                        tokenCount++
+                        
+                        // Accumulate token for logging
+                        accumulatedResponse.append(token)
+                        
+                        // Format according to OpenAI SSE format for chat
+                        val chunk = mapOf(
+                            "id" to id,
+                            "object" to "chat.completion.chunk",
+                            "created" to created,
+                            "model" to model.getModelName(),
+                            "choices" to listOf(
+                                mapOf(
+                                    "index" to 0,
+                                    "delta" to mapOf(
+                                        "content" to token
+                                    ),
+                                    "finish_reason" to null
+                                )
+                            )
+                        )
+                        
+                        // Write SSE format: "data: {json}\n\n"
+                        val sseData = "data: ${gson.toJson(chunk)}\n\n"
+                        outputStream.write(sseData.toByteArray(Charsets.UTF_8))
+                        outputStream.flush()
+                        
+                        LogManager.d(TAG, "Streamed multimodal token $tokenCount")
+                    } catch (e: IOException) {
+                        // Client disconnected - stop streaming gracefully
+                        LogManager.d(TAG, "Client disconnected during multimodal streaming (token $tokenCount)")
+                        throw e
+                    } catch (e: Exception) {
+                        LogManager.e(TAG, "Error writing multimodal token to stream", e)
+                        throw e
+                    }
+                }
+            }
+            
+            // Wait for streaming to complete
+            // Using runBlocking is necessary here because Javalin handlers are not suspend functions
+            // Blocking is acceptable for streaming responses as we need to keep the connection open
+            if (job != null) {
+                runBlocking { job.join() }
+            } else {
+                LogManager.e(TAG, "Failed to start streaming: generateStream returned null")
+                // Write error chunk to client
+                val errorChunk = mapOf(
+                    "id" to id,
+                    "object" to "chat.completion.chunk",
+                    "created" to created,
+                    "model" to model.getModelName(),
+                    "choices" to listOf(
+                        mapOf(
+                            "index" to 0,
+                            "delta" to mapOf(
+                                "content" to "Error: Failed to start streaming"
+                            ),
+                            "finish_reason" to "error"
+                        )
+                    )
+                )
+                val errorData = "data: ${gson.toJson(errorChunk)}\n\ndata: [DONE]\n\n"
+                outputStream.write(errorData.toByteArray(Charsets.UTF_8))
+                outputStream.flush()
+                return
+            }
+            
+            // Send final chunk with finish_reason
+            try {
+                val finalChunk = mapOf(
+                    "id" to id,
+                    "object" to "chat.completion.chunk",
+                    "created" to created,
+                    "model" to model.getModelName(),
+                    "choices" to listOf(
+                        mapOf(
+                            "index" to 0,
+                            "delta" to mapOf<String, String>(),
+                            "finish_reason" to "stop"
+                        )
+                    )
+                )
+                val finalData = "data: ${gson.toJson(finalChunk)}\n\ndata: [DONE]\n\n"
+                outputStream.write(finalData.toByteArray(Charsets.UTF_8))
+                outputStream.flush()
+                
+                LogManager.i(TAG, "Chat streaming completed with $tokenCount tokens")
+                
+                // Log request if logging is enabled (after streaming completes)
+                val fullResponse = mapOf(
+                    "id" to id,
+                    "object" to "chat.completion",
+                    "created" to created,
+                    "model" to model.getModelName(),
+                    "choices" to listOf(
+                        mapOf(
+                            "index" to 0,
+                            "message" to mapOf(
+                                "role" to "assistant",
+                                "content" to accumulatedResponse.toString()
+                            ),
+                            "finish_reason" to "stop"
+                        )
+                    )
+                )
+                val responseJson = gson.toJson(fullResponse)
+                logRequestIfEnabled(ctx, "/v1/chat/completions", bodyText, responseJson)
+            } catch (e: IOException) {
+                // Client disconnected before the final chunk could be sent — this is normal.
+                LogManager.d(TAG, "Client disconnected before final chat streaming chunk: ${e.message}")
+            } catch (e: IllegalStateException) {
+                // Handle Jetty output stream state errors gracefully
+                // This can happen if the client disconnected or the stream is already closed
+                LogManager.d(TAG, "Output stream no longer writable (client may have disconnected): ${e.message}")
+            }
+        } catch (e: IOException) {
+            // Client disconnected during chat streaming — not an application error.
+            LogManager.d(TAG, "Client disconnected during chat streaming: ${e.message}")
+        } catch (e: Exception) {
+            LogManager.e(TAG, "Error in chat streaming", e)
+        }
+        // Note: Javalin manages the output stream lifecycle; don't close it manually
+    }
+    
+    private fun handleCompletions(ctx: JavalinContext) {
+        LogManager.d(TAG, "Handling /v1/completions")
+        
+        // Check if text completions endpoint is enabled
+        if (!checkEndpointEnabled(ctx, "Text Completions", settingsManager.isTextCompletionsEnabled())) {
+            return
+        }
+        
+        try {
+            val bodyText = ctx.body()
+            
+            // Security: Check content length
+            if (bodyText.length > MAX_REQUEST_BODY_SIZE) {
+                LogManager.w(TAG, "Request body too large: ${bodyText.length} bytes")
+                val errorResponse = mapOf(
+                    "error" to mapOf("message" to "Request body too large")
+                )
+                ctx.status(413).contentType("application/json").result(gson.toJson(errorResponse))
+                return
+            }
+            
+            val request = gson.fromJson(bodyText, JsonObject::class.java)
+            
+            // Extract parameters
+            val prompt = request.get("prompt")?.asString ?: ""
+            val stream = request.get("stream")?.asBoolean ?: false
+            
+            // Extract session ID using helper method
+            val sessionId = extractSessionId(ctx, request)
+            
+            LogManager.d(TAG, "Text completion - Using session ID: $sessionId")
+            
+            // Build generation config from request parameters
+            val config = extractGenerationConfig(request)
+            
+            // Acquire a permit before running inference. If max concurrency is reached the
+            // calling thread blocks here until a permit becomes available (FIFO queue).
+            LogManager.d(TAG, "Acquiring concurrency permit (available: ${requestSemaphore.availablePermits()}, queue depth: ${requestSemaphore.queueLength})")
+            requestSemaphore.acquire()
+            LogManager.d(TAG, "Concurrency permit acquired for text completion")
+            try {
+                if (stream) {
+                    handleCompletionStreamingResponse(ctx, prompt, config, sessionId, bodyText)
+                } else {
+                    handleCompletionNonStreamingResponse(ctx, prompt, config, sessionId, bodyText)
+                }
+            } finally {
+                requestSemaphore.release()
+            }
+        } catch (e: Exception) {
+            LogManager.e(TAG, "Error handling completions", e)
+            val errorResponse = mapOf(
+                "error" to mapOf("message" to (e.message ?: "Internal server error"))
+            )
+            ctx.status(500).contentType("application/json").result(gson.toJson(errorResponse))
+        }
+    }
+    
+    private fun handleCompletionNonStreamingResponse(
+        ctx: JavalinContext,
+        prompt: String,
+        config: GenerationConfig,
+        sessionId: String,
+        bodyText: String
+    ) {
+        // Generate response with session ID
+        val completion = model.generate(prompt, config, sessionId)
+        
+        val promptTokens = prompt.split(" ").size
+        val completionTokens = completion.split(" ").size
+        
+        val response = mapOf(
+            "id" to "cmpl-${System.currentTimeMillis()}",
+            "object" to "text_completion",
+            "created" to System.currentTimeMillis() / 1000,
+            "model" to model.getModelName(),
+            "choices" to listOf(
+                mapOf(
+                    "text" to completion,
+                    "index" to 0,
+                    "finish_reason" to "stop"
+                )
+            ),
+            "usage" to mapOf(
+                "prompt_tokens" to promptTokens,
+                "completion_tokens" to completionTokens,
+                "total_tokens" to (promptTokens + completionTokens)
+            )
+        )
+        
+        val responseJson = gson.toJson(response)
+        
+        // Log request if logging is enabled
+        logRequestIfEnabled(ctx, "/v1/completions", bodyText, responseJson)
+        
+        ctx.contentType("application/json").result(responseJson)
+    }
+    
+    private fun handleCompletionStreamingResponse(
+        ctx: JavalinContext,
+        prompt: String,
+        config: GenerationConfig,
+        sessionId: String,
+        bodyText: String
+    ) {
+        LogManager.i(TAG, "Starting completion streaming response for session: $sessionId")
+        
+        val id = "cmpl-${System.currentTimeMillis()}"
+        val created = System.currentTimeMillis() / 1000
+        
+        // Use Javalin's SSE support for streaming
+        ctx.contentType("text/event-stream")
+        ctx.header("Cache-Control", "no-cache")
+        ctx.header("Connection", "keep-alive")
+        
+        // Get the response output stream
+        val outputStream = ctx.res.getOutputStream()
+        
+        // Accumulate response for logging (using StringBuffer for thread safety)
+        val accumulatedResponse = StringBuffer()
+        
+        try {
+            var tokenCount = 0
+            
+            val job = model.generateStream(prompt, config, sessionId) { token ->
+                try {
+                    tokenCount++
+                    
+                    // Accumulate token for logging
+                    accumulatedResponse.append(token)
+                    
+                    // Format according to OpenAI SSE format for completions
+                    val chunk = mapOf(
+                        "id" to id,
+                        "object" to "text_completion",
+                        "created" to created,
+                        "model" to model.getModelName(),
+                        "choices" to listOf(
+                            mapOf(
+                                "text" to token,
+                                "index" to 0,
+                                "finish_reason" to null
+                            )
+                        )
+                    )
+                    
+                    // Write SSE format: "data: {json}\n\n"
+                    val sseData = "data: ${gson.toJson(chunk)}\n\n"
+                    outputStream.write(sseData.toByteArray(Charsets.UTF_8))
+                    outputStream.flush()
+                    
+                    LogManager.d(TAG, "Streamed token $tokenCount")
+                } catch (e: IOException) {
+                    // Client disconnected - stop streaming gracefully
+                    LogManager.d(TAG, "Client disconnected during streaming (token $tokenCount)")
+                    throw e
+                } catch (e: Exception) {
+                    LogManager.e(TAG, "Error writing token to stream", e)
+                    throw e
+                }
+            }
+            
+            // Wait for streaming to complete
+            // Using runBlocking is necessary here because Javalin handlers are not suspend functions
+            // Blocking is acceptable for streaming responses as we need to keep the connection open
+            if (job != null) {
+                runBlocking { job.join() }
+            } else {
+                LogManager.e(TAG, "Failed to start streaming: generateStream returned null")
+                // Write error chunk to client
+                val errorChunk = mapOf(
+                    "id" to id,
+                    "object" to "text_completion",
+                    "created" to created,
+                    "model" to model.getModelName(),
+                    "choices" to listOf(
+                        mapOf(
+                            "text" to "Error: Failed to start streaming",
+                            "index" to 0,
+                            "finish_reason" to "error"
+                        )
+                    )
+                )
+                val errorData = "data: ${gson.toJson(errorChunk)}\n\ndata: [DONE]\n\n"
+                outputStream.write(errorData.toByteArray(Charsets.UTF_8))
+                outputStream.flush()
+                return
+            }
+            
+            // Send final chunk with finish_reason
+            try {
+                val finalChunk = mapOf(
+                    "id" to id,
+                    "object" to "text_completion",
+                    "created" to created,
+                    "model" to model.getModelName(),
+                    "choices" to listOf(
+                        mapOf(
+                            "text" to "",
+                            "index" to 0,
+                            "finish_reason" to "stop"
+                        )
+                    )
+                )
+                val finalData = "data: ${gson.toJson(finalChunk)}\n\ndata: [DONE]\n\n"
+                outputStream.write(finalData.toByteArray(Charsets.UTF_8))
+                outputStream.flush()
+                
+                LogManager.i(TAG, "Completion streaming completed with $tokenCount tokens")
+                
+                // Log request if logging is enabled (after streaming completes)
+                val fullResponse = mapOf(
+                    "id" to id,
+                    "object" to "text_completion",
+                    "created" to created,
+                    "model" to model.getModelName(),
+                    "choices" to listOf(
+                        mapOf(
+                            "text" to accumulatedResponse.toString(),
+                            "index" to 0,
+                            "finish_reason" to "stop"
+                        )
+                    )
+                )
+                val responseJson = gson.toJson(fullResponse)
+                logRequestIfEnabled(ctx, "/v1/completions", bodyText, responseJson)
+            } catch (e: IOException) {
+                // Client disconnected before the final chunk could be sent — this is normal.
+                LogManager.d(TAG, "Client disconnected before final completion streaming chunk: ${e.message}")
+            } catch (e: IllegalStateException) {
+                // Handle Jetty output stream state errors gracefully
+                // This can happen if the client disconnected or the stream is already closed
+                LogManager.d(TAG, "Output stream no longer writable (client may have disconnected): ${e.message}")
+            }
+        } catch (e: IOException) {
+            // Client disconnected during completion streaming — not an application error.
+            LogManager.d(TAG, "Client disconnected during completion streaming: ${e.message}")
+        } catch (e: Exception) {
+            LogManager.e(TAG, "Error in completion streaming", e)
+        }
+        // Note: Javalin manages the output stream lifecycle; don't close it manually
+    }
+    
+    /**
+     * Build prompt from messages with multimodal support.
+     * Returns either a simple String prompt or a List of Content objects for multimodal inputs.
+     * 
+     * OpenAI multimodal format:
+     * - content can be a string: "Hello"
+     * - content can be an array: [{"type": "text", "text": "Hello"}, {"type": "image_url", "image_url": {"url": "..."}}]
+     */
+    private fun buildContentsFromMessages(messages: com.google.gson.JsonArray): Any {
+        // Check if any message has multimodal content
+        var hasMultimodal = false
+        for (message in messages) {
+            val msgObj = message.asJsonObject
+            val contentElement = msgObj.get("content")
+            if (contentElement != null && contentElement.isJsonArray) {
+                hasMultimodal = true
+                break
+            }
+        }
+        
+        // If no multimodal content, build a simple text prompt for backward compatibility
+        if (!hasMultimodal) {
+            val promptBuilder = StringBuilder()
+            for (message in messages) {
+                val msgObj = message.asJsonObject
+                val role = msgObj.get("role")?.asString ?: ""
+                val content = msgObj.get("content")?.asString ?: ""
+                promptBuilder.append("$role: $content\n")
+            }
+            return promptBuilder.toString()
+        }
+        
+        // Build list of Content objects for multimodal support
+        val contentsList = mutableListOf<Content>()
+        
+        for (message in messages) {
+            val msgObj = message.asJsonObject
+            val role = msgObj.get("role")?.asString ?: ""
+            val contentElement = msgObj.get("content")
+            
+            // Add role prefix as text
+            if (role.isNotEmpty()) {
+                contentsList.add(Content.Text("$role: "))
+            }
+            
+            when {
+                contentElement == null -> {
+                    // Empty content, skip
+                }
+                contentElement.isJsonPrimitive && contentElement.asJsonPrimitive.isString -> {
+                    // Simple text content
+                    contentsList.add(Content.Text(contentElement.asString))
+                }
+                contentElement.isJsonArray -> {
+                    // Multimodal content: array of content parts
+                    contentsList.addAll(parseMultimodalContentToObjects(contentElement.asJsonArray))
+                }
+                else -> {
+                    contentsList.add(Content.Text(contentElement.toString()))
+                }
+            }
+            
+            // Add newline after each message
+            contentsList.add(Content.Text("\n"))
+        }
+        
+        return contentsList
+    }
+    
+    /**
+     * Parse multimodal content from OpenAI format to LiteRT Content objects.
+     * 
+     * OpenAI format -> LiteRT format:
+     * - {"type": "text", "text": "..."} -> Content.Text(...)
+     * - {"type": "image_url", "image_url": {"url": "data:image/...;base64,..."}} -> Content.ImageBytes(bytes)
+     * - {"type": "image_url", "image_url": {"url": "http://..."}} -> Content.Text("[Image URL: ...]") (URLs not supported yet)
+     * - {"type": "input_audio", "input_audio": {"data": "base64...", "format": "..."}} -> Content.AudioBytes(bytes)
+     */
+    private fun parseMultimodalContentToObjects(contentArray: com.google.gson.JsonArray): List<Content> {
+        val contents = mutableListOf<Content>()
+        
+        for (contentPart in contentArray) {
+            val partObj = contentPart.asJsonObject
+            val type = partObj.get("type")?.asString ?: continue
+            
+            when (type) {
+                "text" -> {
+                    val text = partObj.get("text")?.asString ?: ""
+                    if (text.isNotEmpty()) {
+                        contents.add(Content.Text(text))
+                    }
+                }
+                "image_url" -> {
+                    val imageUrlObj = partObj.get("image_url")?.asJsonObject
+                    val url = imageUrlObj?.get("url")?.asString ?: ""
+                    val detail = imageUrlObj?.get("detail")?.asString ?: "auto"
+                    
+                    if (url.startsWith("data:image")) {
+                        // Extract base64 image data
+                        try {
+                            val base64Data = url.substringAfter("base64,")
+                            val imageBytes = Base64.decode(base64Data, Base64.DEFAULT)
+                            contents.add(Content.ImageBytes(imageBytes))
+                            LogManager.i(TAG, "Multimodal: Decoded base64 image (${imageBytes.size} bytes, detail=$detail)")
+                        } catch (e: Exception) {
+                            LogManager.e(TAG, "Failed to decode base64 image", e)
+                            contents.add(Content.Text("\n[Error decoding image: ${e.message}]\n"))
+                        }
+                    } else {
+                        // Image URLs not directly supported - would need to fetch the image
+                        LogManager.w(TAG, "Multimodal: Image URLs not supported yet, only base64 encoded images: $url")
+                        contents.add(Content.Text("\n[Image URL not supported: $url (use base64 encoding instead)]\n"))
+                    }
+                }
+                "input_audio" -> {
+                    val audioObj = partObj.get("input_audio")?.asJsonObject
+                    val audioData = audioObj?.get("data")?.asString
+                    val format = audioObj?.get("format")?.asString ?: "unknown"
+                    
+                    if (audioData != null) {
+                        try {
+                            val audioBytes = Base64.decode(audioData, Base64.DEFAULT)
+                            contents.add(Content.AudioBytes(audioBytes))
+                            LogManager.i(TAG, "Multimodal: Decoded audio data (${audioBytes.size} bytes, format=$format)")
+                        } catch (e: Exception) {
+                            LogManager.e(TAG, "Failed to decode audio data", e)
+                            contents.add(Content.Text("\n[Error decoding audio: ${e.message}]\n"))
+                        }
+                    } else {
+                        LogManager.w(TAG, "Multimodal: Audio input missing data field")
+                        contents.add(Content.Text("\n[Audio input missing data]\n"))
+                    }
+                }
+                else -> {
+                    LogManager.w(TAG, "Unknown content type: $type")
+                }
+            }
+        }
+        
+        return contents
+    }
+    
+    /**
+     * Legacy method for building simple text prompts.
+     * Kept for backward compatibility with text-only models.
+     */
+    private fun buildPromptFromMessages(messages: com.google.gson.JsonArray): String {
+        val contents = buildContentsFromMessages(messages)
+        return if (contents is String) {
+            contents
+        } else {
+            // If multimodal, build a text representation
+            (contents as List<*>).joinToString("") { 
+                when (it) {
+                    is Content.Text -> it.toString()
+                    is Content.ImageBytes -> "[Image]"
+                    is Content.AudioBytes -> "[Audio]"
+                    else -> it.toString()
+                }
+            }
+        }
+    }
+    
+    /**
+     * Helper function to parse metadata from JsonObject to Map<String, Any>
+     * Properly converts JsonElement to Kotlin types for correct serialization
+     */
+    private fun parseMetadata(metadataJson: com.google.gson.JsonObject?): Map<String, Any>? {
+        return metadataJson?.let { meta ->
+            meta.entrySet().associate { entry ->
+                val value: Any = when {
+                    entry.value.isJsonPrimitive -> {
+                        val primitive = entry.value.asJsonPrimitive
+                        when {
+                            primitive.isBoolean -> primitive.asBoolean
+                            primitive.isNumber -> primitive.asNumber
+                            primitive.isString -> primitive.asString
+                            else -> primitive.asString
+                        }
+                    }
+                    entry.value.isJsonNull -> "null"
+                    else -> entry.value.toString()
+                }
+                entry.key to value
+            }
+        }
+    }
+    
+    /**
+     * Helper function to get all messages including the assistant response.
+     * Returns Map<String, Any> to support multimodal content.
+     */
+    private fun getAllMessages(storedCompletion: StoredCompletion): List<Map<String, Any>> {
+        val allMessages = storedCompletion.messages.toMutableList()
+        allMessages.add(mapOf(
+            "role" to "assistant",
+            "content" to storedCompletion.responseContent
+        ))
+        return allMessages
+    }
+    
+    /**
+     * Handle GET /v1/chat/completions/{completion_id}
+     * Get a stored chat completion. Only completions created with store=true are returned.
+     */
+    private fun handleGetStoredCompletion(ctx: JavalinContext) {
+        val completionId = ctx.pathParam("completion_id")
+        LogManager.d(TAG, "Handling GET /v1/chat/completions/$completionId")
+        
+        try {
+            val storedCompletion = storedCompletions[completionId]
+            
+            if (storedCompletion == null) {
+                val errorResponse = mapOf(
+                    "error" to mapOf(
+                        "message" to "Completion not found: $completionId",
+                        "type" to "invalid_request_error"
+                    )
+                )
+                ctx.status(404).contentType("application/json").result(gson.toJson(errorResponse))
+                return
+            }
+            
+            // Use helper function to get all messages
+            val allMessages = getAllMessages(storedCompletion)
+            
+            val response = mutableMapOf<String, Any>(
+                "id" to storedCompletion.id,
+                "object" to storedCompletion.obj,
+                "created" to storedCompletion.created,
+                "model" to storedCompletion.model,
+                "choices" to listOf(
+                    mapOf(
+                        "index" to 0,
+                        "message" to mapOf(
+                            "role" to "assistant",
+                            "content" to storedCompletion.responseContent
+                        ),
+                        "finish_reason" to "stop"
+                    )
+                )
+            )
+            
+            // Add metadata if present
+            storedCompletion.metadata?.let { response["metadata"] = it }
+            
+            LogManager.i(TAG, "Retrieved stored completion: $completionId")
+            ctx.contentType("application/json").result(gson.toJson(response))
+        } catch (e: Exception) {
+            LogManager.e(TAG, "Error retrieving stored completion $completionId", e)
+            val errorResponse = mapOf(
+                "error" to mapOf("message" to (e.message ?: "Failed to retrieve completion"))
+            )
+            ctx.status(500).contentType("application/json").result(gson.toJson(errorResponse))
+        }
+    }
+    
+    /**
+     * Handle GET /v1/chat/completions/{completion_id}/messages
+     * Get the messages in a stored chat completion.
+     */
+    private fun handleGetStoredCompletionMessages(ctx: JavalinContext) {
+        val completionId = ctx.pathParam("completion_id")
+        LogManager.d(TAG, "Handling GET /v1/chat/completions/$completionId/messages")
+        
+        try {
+            val storedCompletion = storedCompletions[completionId]
+            
+            if (storedCompletion == null) {
+                val errorResponse = mapOf(
+                    "error" to mapOf(
+                        "message" to "Completion not found: $completionId",
+                        "type" to "invalid_request_error"
+                    )
+                )
+                ctx.status(404).contentType("application/json").result(gson.toJson(errorResponse))
+                return
+            }
+            
+            // Use helper function to get all messages
+            val allMessages = getAllMessages(storedCompletion)
+            
+            val response = mapOf(
+                "object" to "list",
+                "data" to allMessages.mapIndexed { index, msg ->
+                    mapOf(
+                        "id" to "$completionId-msg-$index",
+                        "object" to "chat.completion.message",
+                        "created" to storedCompletion.created,
+                        "role" to msg["role"],
+                        "content" to msg["content"]
+                    )
+                }
+            )
+            
+            LogManager.i(TAG, "Retrieved messages for completion: $completionId")
+            ctx.contentType("application/json").result(gson.toJson(response))
+        } catch (e: Exception) {
+            LogManager.e(TAG, "Error retrieving messages for completion $completionId", e)
+            val errorResponse = mapOf(
+                "error" to mapOf("message" to (e.message ?: "Failed to retrieve messages"))
+            )
+            ctx.status(500).contentType("application/json").result(gson.toJson(errorResponse))
+        }
+    }
+    
+    /**
+     * Handle POST /v1/chat/completions/{completion_id}
+     * Update a stored chat completion. Only metadata updates are supported.
+     */
+    private fun handleUpdateStoredCompletion(ctx: JavalinContext) {
+        val completionId = ctx.pathParam("completion_id")
+        LogManager.d(TAG, "Handling POST /v1/chat/completions/$completionId")
+        
+        try {
+            val storedCompletion = storedCompletions[completionId]
+            
+            if (storedCompletion == null) {
+                val errorResponse = mapOf(
+                    "error" to mapOf(
+                        "message" to "Completion not found: $completionId",
+                        "type" to "invalid_request_error"
+                    )
+                )
+                ctx.status(404).contentType("application/json").result(gson.toJson(errorResponse))
+                return
+            }
+            
+            val bodyText = ctx.body()
+            val request = gson.fromJson(bodyText, JsonObject::class.java)
+            
+            // Extract metadata from request
+            val newMetadata = parseMetadata(request.get("metadata")?.asJsonObject)
+            
+            if (newMetadata == null) {
+                val errorResponse = mapOf(
+                    "error" to mapOf(
+                        "message" to "metadata field is required",
+                        "type" to "invalid_request_error"
+                    )
+                )
+                ctx.status(400).contentType("application/json").result(gson.toJson(errorResponse))
+                return
+            }
+            
+            // Update metadata
+            storedCompletion.metadata = newMetadata
+            
+            val response = mutableMapOf<String, Any>(
+                "id" to storedCompletion.id,
+                "object" to storedCompletion.obj,
+                "created" to storedCompletion.created,
+                "model" to storedCompletion.model,
+                "choices" to listOf(
+                    mapOf(
+                        "index" to 0,
+                        "message" to mapOf(
+                            "role" to "assistant",
+                            "content" to storedCompletion.responseContent
+                        ),
+                        "finish_reason" to "stop"
+                    )
+                ),
+                "metadata" to newMetadata
+            )
+            
+            LogManager.i(TAG, "Updated metadata for completion: $completionId")
+            ctx.contentType("application/json").result(gson.toJson(response))
+        } catch (e: Exception) {
+            LogManager.e(TAG, "Error updating completion $completionId", e)
+            val errorResponse = mapOf(
+                "error" to mapOf("message" to (e.message ?: "Failed to update completion"))
+            )
+            ctx.status(500).contentType("application/json").result(gson.toJson(errorResponse))
+        }
+    }
+    
+    /**
+     * Extract session ID from request using multiple methods in priority order:
+     * 1. conversation_id field (OpenAI Conversations API standard)
+     * 2. user field (OpenAI standard)
+     * 3. session_id field
+     * 4. X-Session-ID header
+     * 5. default session
+     * 
+     * Validates and sanitizes session IDs to prevent injection attacks.
+     */
+    private fun extractSessionId(ctx: JavalinContext, request: JsonObject): String {
+        val rawSessionId = request.get("conversation_id")?.asString
+            ?: request.get("user")?.asString
+            ?: request.get("session_id")?.asString
+            ?: ctx.header("X-Session-ID")
+            ?: "default"
+        
+        // Sanitize session ID: allow only alphanumeric, dash, underscore, dot, and @
+        // This prevents potential injection attacks and ensures safe usage
+        return rawSessionId.filter { it.isLetterOrDigit() || it in "-_.@" }
+            .take(128) // Limit length to prevent excessive memory usage
+            .ifEmpty { "default" } // Fall back to default if sanitized ID is empty
+    }
+    
+    /**
+     * Extract generation configuration from OpenAI API request.
+     * Supports parameters compatible with LiteRT's SamplerConfig.
+     */
+    private fun extractGenerationConfig(request: JsonObject): GenerationConfig {
+        // Parse extra_body for additional context (OpenAI API compatibility)
+        val extraContext = parseExtraBody(request.getAsJsonObject("extra_body"))
+        
+        return GenerationConfig(
+            maxTokens = request.get("max_tokens")?.asInt ?: 100,
+            temperature = request.get("temperature")?.asDouble ?: 0.7,
+            topK = request.get("top_k")?.asInt ?: 40,
+            topP = request.get("top_p")?.asDouble ?: 0.95,
+            seed = request.get("seed")?.asInt ?: -1,
+            extraContext = extraContext
+        )
+    }
+    
+    /**
+     * Parse extra_body from request for OpenAI API compatibility.
+     * The extra_body parameter allows passing additional JSON properties 
+     * that can be used for model-specific features like thinking mode.
+     */
+    private fun parseExtraBody(extraBodyObj: com.google.gson.JsonObject?): Map<String, Any>? {
+        if (extraBodyObj == null || extraBodyObj.isEmpty()) {
+            return null
+        }
+        
+        LogManager.d(TAG, "Extra body provided in request with ${extraBodyObj.size()} properties")
+        
+        // Convert JsonObject to Map<String, Any>
+        return extraBodyObj.entrySet().associate { entry ->
+            val value: Any? = when {
+                entry.value.isJsonPrimitive -> {
+                    val primitive = entry.value.asJsonPrimitive
+                    when {
+                        primitive.isBoolean -> primitive.asBoolean
+                        primitive.isNumber -> {
+                            // Convert to Double for consistency and to avoid precision issues
+                            primitive.asDouble
+                        }
+                        primitive.isString -> primitive.asString
+                        else -> primitive.asString
+                    }
+                }
+                entry.value.isJsonNull -> null as Any?
+                entry.value.isJsonArray -> entry.value.toString()
+                entry.value.isJsonObject -> entry.value.toString()
+                else -> entry.value.toString()
+            }
+            entry.key to value
+        }.filterValues { it != null } as Map<String, Any>
+    }
+    /**
+     * Helper to map OpenAI-style messages to Llama model content format.
+     */
+    private fun buildContentsFromMessages(messages: List<Map<String, Any>>): List<Content> {
+        return messages.map { msg ->
+            val role = msg["role"] as? String ?: "user"
+            val contentValue = msg["content"]
+            
+            val text = when (contentValue) {
+                is String -> contentValue
+                is List<*> -> contentValue.filterIsInstance<Map<String, Any>>()
+                    .joinToString("\n") { it["text"] as? String ?: "" }
+                else -> ""
+            }
+            
+            Content.Builder().setRole(role).setText(text).build()
+        }
+    }
+
+    /**
+     * Handles streaming responses for chat completions.
+     */
+    private suspend fun handleChatStreamingResponse(ctx: JavalinContext, messages: List<Map<String, Any>>) {
+        val contents = buildContentsFromMessages(messages)
+        val flow = model.generateStream(contents)
+        
+        ctx.res().contentType = "text/event-stream"
+        ctx.res().writer.use { writer ->
+            flow.collect { chunk ->
+                val json = gson.toJson(mapOf(
+                    "choices" to listOf(mapOf("delta" to mapOf("content" to chunk)))
+                ))
+                writer.write("data: $json\n\n")
+                writer.flush()
+            }
+            writer.write("data: [DONE]\n\n")
+            writer.flush()
+        }
+    }
+}
