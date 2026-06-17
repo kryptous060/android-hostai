@@ -37,14 +37,11 @@ jobs:
           else
             echo "has_keystore=true" >> "$GITHUB_OUTPUT"
           fi
-      
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug --no-daemon
-      
-      - name: Build Release APK and AAB (unsigned)
+
+      - name: Build Release APK (unsigned)
         if: steps.check_keystore.outputs.has_keystore != 'true'
-        run: ./gradlew assembleRelease bundleRelease --no-daemon
-      
+        run: ./gradlew assembleRelease --no-daemon
+
       # FIX 1: Added '-i' to ignore newlines and moved file to ROOT (removed 'app/')
       - name: Decode Keystore
         if: steps.check_keystore.outputs.has_keystore == 'true'
@@ -52,16 +49,16 @@ jobs:
           echo "${{ secrets.KEYSTORE_FILE }}" | base64 -di > keystore.jks
       
       # FIX 2: Path now matches the file created above
-      - name: Build Signed Release APK and AAB
+      - name: Build Signed Release APK
         if: steps.check_keystore.outputs.has_keystore == 'true'
         run: |
-          ./gradlew assembleRelease bundleRelease \
+          ./gradlew assembleRelease \
             -Pandroid.injected.signing.store.file=$(pwd)/keystore.jks \
             -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
             -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
             -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}" \
             --no-daemon
-      
+
       - name: Clean up keystore
         if: steps.check_keystore.outputs.has_keystore == 'true'
         run: rm -f keystore.jks
