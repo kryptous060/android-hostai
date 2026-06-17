@@ -130,12 +130,21 @@ class OpenAIApiServer(
                     )
                     ctx.status(500).contentType("application/json").result(gson.toJson(errorResponse))
                 }
+               try {
+            // 1. Tell Javalin to disable Loom FIRST
+            io.javalin.util.ConcurrencyUtil.useLoom = false
+
+            // 2. Now start the server safely
+            server = Javalin.create { config ->
+                // ... any existing configuration code ...
             }.start(port)
             
             LogManager.i(TAG, "Javalin server started on port $port")
         } catch (e: Exception) {
             LogManager.e(TAG, "Failed to start Javalin server", e)
             throw e
+        }
+
         }
     }
     
