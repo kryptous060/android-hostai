@@ -1451,10 +1451,10 @@ class OpenAIApiServer(
         }.filterValues { it != null } as Map<String, Any>
     }
     /**
-     * Helper to map OpenAI-style messages to Llama model content format.
+     * Helper to map OpenAI-style messages into a standard prompt string.
      */
     private fun buildContentsFromMessages(messages: List<Map<String, Any>>): String {
-        val promptBuilder = java.lang.StringBuilder()
+        val promptBuilder = StringBuilder()
         for (msg in messages) {
             val role = msg["role"] as? String ?: "user"
             val text = msg["content"] as? String ?: ""
@@ -1463,15 +1463,19 @@ class OpenAIApiServer(
         return promptBuilder.toString()
     }
 
+    /**
+     * Handles streaming responses for chat completions.
+     */
     private suspend fun handleChatStreamingResponse(ctx: JavalinContext, messages: List<Map<String, Any>>) {
         val prompt = buildContentsFromMessages(messages)
         
-        // Use standard Javalin syntax for the content type
         ctx.contentType("text/event-stream")
+        
+        // Explicitly define the writer type
         val writer: java.io.PrintWriter = ctx.res().writer
         
         try {
-            // Use the callback format that your LlamaModel expects
+            // Use the callback format your model expects
             val job = model.generateStream(prompt) { chunk: String ->
                 val json = gson.toJson(mapOf(
                     "choices" to listOf(mapOf("delta" to mapOf("content" to chunk)))
@@ -1480,7 +1484,7 @@ class OpenAIApiServer(
                 writer.flush()
             }
             
-            // Wait for the stream job to finish
+            // Wait for generation to complete
             job?.join()
             
             writer.write("data: [DONE]\n\n")
@@ -1488,5 +1492,6 @@ class OpenAIApiServer(
         } catch (e: Exception) {
             LogManager.e("OpenAIApiServer", "Error during streaming response", e)
         }
+    
     }
 }
