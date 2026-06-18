@@ -23,7 +23,7 @@ import kotlinx.coroutines.launch
  */
 class ApiServerService : Service() {
     
-    private val binder = LocalBinder()
+    private val binder = LocalBinder(this)
     private var apiServer: OpenAIApiServer? = null
     private var model: LlamaModel? = null
     @Volatile private var isRunning = false
