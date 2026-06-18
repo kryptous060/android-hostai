@@ -29,6 +29,10 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
       
+      # Added this step to ensure a fresh environment every time
+      - name: Clean build
+        run: ./gradlew clean
+
       - name: Check if keystore secret exists
         id: check_keystore
         run: |
@@ -38,7 +42,6 @@ jobs:
             echo "has_keystore=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # FIX: Added 'bundleRelease' to generate the AAB file alongside the APK
       - name: Build Release APK & AAB (unsigned)
         if: steps.check_keystore.outputs.has_keystore != 'true'
         run: ./gradlew assembleRelease bundleRelease --no-daemon
@@ -48,7 +51,6 @@ jobs:
         run: |
           echo "${{ secrets.KEYSTORE_FILE }}" | base64 -di > keystore.jks
       
-      # FIX: Added 'bundleRelease' here as well to generate the signed AAB file
       - name: Build Signed Release APK & AAB
         if: steps.check_keystore.outputs.has_keystore == 'true'
         run: |
@@ -63,7 +65,6 @@ jobs:
         if: steps.check_keystore.outputs.has_keystore == 'true'
         run: rm -f keystore.jks
       
-      # FIX: Consolidated into a single clean bash step with proper closing 'fi' tags
       - name: Copy artifacts
         run: |
           mkdir -p artifacts
@@ -73,21 +74,20 @@ jobs:
             cp app/build/outputs/apk/debug/app-debug.apk artifacts/HostAI-debug.apk
           fi
           
-          # Copy release APK (Checks for both signed and unsigned filenames)
+          # Copy release APK
           if [ -f app/build/outputs/apk/release/app-release.apk ]; then
             cp app/build/outputs/apk/release/app-release.apk artifacts/HostAI-release.apk
           elif [ -f app/build/outputs/apk/release/app-release-unsigned.apk ]; then
             cp app/build/outputs/apk/release/app-release-unsigned.apk artifacts/HostAI-release.apk
           fi
           
-          # Copy release AAB (Checks for both signed and unsigned filenames)
+          # Copy release AAB
           if [ -f app/build/outputs/bundle/release/app-release.aab ]; then
             cp app/build/outputs/bundle/release/app-release.aab artifacts/HostAI-release.aab
           elif [ -f app/build/outputs/bundle/release/app-release-unsigned.aab ]; then
             cp app/build/outputs/bundle/release/app-release-unsigned.aab artifacts/HostAI-release.aab
           fi
       
-      # FIX: Changed path to 'artifacts/' to upload all generated APKs and AABs together
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
