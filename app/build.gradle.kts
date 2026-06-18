@@ -37,6 +37,8 @@ android {
     kotlin {
         compilerOptions {
             jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
+            // Tells Kotlin 2.1.0 to safely ignore the Kotlin 2.3.0 metadata version warning
+            freeCompilerArgs.add("-Xskip-metadata-version-check")
         }
     }
     
