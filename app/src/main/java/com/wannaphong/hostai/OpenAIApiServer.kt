@@ -101,6 +101,9 @@ class OpenAIApiServer(
             threadPool.name = "hostai-jetty"
             
             app = Javalin.create { config ->
+                // Assign the pre-warmed thread pool to Jetty
+                config.jetty.threadPool(threadPool) 
+                
                 // Configure Javalin
                 config.maxRequestSize = MAX_REQUEST_BODY_SIZE.toLong()
                 config.showJavalinBanner = false
