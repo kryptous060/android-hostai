@@ -33,8 +33,11 @@ android {
         targetCompatibility = JavaVersion.VERSION_1_8    
     }
     
-    kotlinOptions {
-        jvmTarget = "1.8"
+    // Modern Kotlin compiler configuration (replaces deprecated jvmTarget)
+    kotlin {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
+        }
     }
     
     buildFeatures {
@@ -43,7 +46,10 @@ android {
 
     packaging {
         resources {
+            // These exclusions prevent duplicate file errors when merging Jetty/Javalin
             excludes.add("org/eclipse/jetty/http/encoding.properties")
+            excludes.add("META-INF/maven/org.eclipse.jetty/jetty-server/pom.properties")
+            excludes.add("about.html")
         }
     }
 }
@@ -61,28 +67,25 @@ dependencies {
     implementation("com.google.android.material:material:1.10.0")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     
-    // Expanded Jetty suite to resolve hidden classpath drops
+    // Jetty suite for HTTP server
     implementation("org.eclipse.jetty:jetty-server:9.4.48.v20220622")
     implementation("org.eclipse.jetty:jetty-util:9.4.48.v20220622")
     implementation("org.eclipse.jetty:jetty-http:9.4.48.v20220622")
     implementation("org.eclipse.jetty:jetty-io:9.4.48.v20220622")
     implementation("org.eclipse.jetty:jetty-servlet:9.4.48.v20220622")
-    compileOnly("javax.servlet:javax.servlet-api:3.1.0")
     
-    // Javalin for HTTP server with Java 8 compatibility
+    // Javalin and supporting libs
     implementation("io.javalin:javalin:4.6.8")
-    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
-
-    // SLF4J for Javalin logging (required dependency)
     implementation("org.slf4j:slf4j-android:1.7.36")
-    
-    // Gson for JSON parsing
     implementation("com.google.code.gson:gson:2.10.1")
     
-    // Coroutines for async operations
+    // Core Android libs
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     
-    implementation("com.google.ai.edge.litertlm:litertlm-android:latest.release")    
+    // LiteRT
+    implementation("com.google.ai.edge.litertlm:litertlm-android:latest.release")
+    
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
