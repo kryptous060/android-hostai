@@ -1,4 +1,13 @@
 pluginManagement {
+    // 1. Combine all repositories here
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+        maven { url = uri("https://storage.googleapis.com/r8-releases/raw") }
+    }
+    
+    // 2. Keep the buildscript dependency for the R8 compiler
     buildscript {
         repositories {
             google()
@@ -6,17 +15,8 @@ pluginManagement {
             maven { url = uri("https://storage.googleapis.com/r8-releases/raw") }
         }
         dependencies {
-            // Forces the build to use a patched version of the R8 compiler
             classpath("com.android.tools:r8:8.8.28")
         }
-    }
-}
-
-pluginManagement {
-    repositories {
-        google()
-        mavenCentral()
-        gradlePluginPortal()
     }
 }
 
@@ -30,5 +30,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "HostAI"
-include(":app
-")
+include(":app")
