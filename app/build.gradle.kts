@@ -62,8 +62,7 @@ dependencies {
     
     // Javalin for HTTP server with Java 8 compatibility
     implementation("io.javalin:javalin:6.1.3") // Verify your version
-    implementation("io.javalin:javalin-jetty:6.1.3") // Ensure this is present
-    
+
     // SLF4J for Javalin logging (required dependency)
     implementation("org.slf4j:slf4j-android:1.7.36")
     
