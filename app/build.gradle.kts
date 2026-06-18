@@ -61,7 +61,8 @@ dependencies {
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     
     // Javalin for HTTP server with Java 8 compatibility
-    implementation("io.javalin:javalin:5.6.3") // Verify your version
+    implementation("io.javalin:javalin:5.6.3")
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
 
     // SLF4J for Javalin logging (required dependency)
     implementation("org.slf4j:slf4j-android:1.7.36")
