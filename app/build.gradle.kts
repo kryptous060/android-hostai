@@ -60,9 +60,14 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.10.0")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+    
+    // Expanded Jetty suite to resolve hidden classpath drops
     implementation("org.eclipse.jetty:jetty-server:9.4.48.v20220622")
     implementation("org.eclipse.jetty:jetty-util:9.4.48.v20220622")
-
+    implementation("org.eclipse.jetty:jetty-http:9.4.48.v20220622")
+    implementation("org.eclipse.jetty:jetty-io:9.4.48.v20220622")
+    implementation("org.eclipse.jetty:jetty-servlet:9.4.48.v20220622")
+    compileOnly("javax.servlet:javax.servlet-api:3.1.0")
     
     // Javalin for HTTP server with Java 8 compatibility
     implementation("io.javalin:javalin:4.6.8")
@@ -77,8 +82,8 @@ dependencies {
     // Coroutines for async operations
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     
-    // LiteRT for LLM inference (0.10.1 adds Gemma 4 support with improved performance)
-    implementation("com.google.ai.edge.litertlm:litertlm-android:0.10.0")
+    // LiteRT for LLM inference (updated to 0.10.1)
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.10.1")
     
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
