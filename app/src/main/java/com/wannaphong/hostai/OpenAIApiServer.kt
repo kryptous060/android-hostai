@@ -108,6 +108,7 @@ class OpenAIApiServer(
                 config.maxRequestSize = MAX_REQUEST_BODY_SIZE.toLong()
                 config.showJavalinBanner = false
             }.apply {
+                
                 // Health check
                 get("/health") { ctx -> handleHealth(ctx) }
                 
