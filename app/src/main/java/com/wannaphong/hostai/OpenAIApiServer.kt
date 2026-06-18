@@ -1475,7 +1475,6 @@ class OpenAIApiServer(
                     
                     val json = gson.toJson(jsonMap)
                     
-                    // Correct: Use .write() on the writer object
                     writer.write("data: $json\n\n")
                     writer.flush()
                 }
@@ -1490,4 +1489,3 @@ class OpenAIApiServer(
             LogManager.e("OpenAIApiServer", "Error during streaming response", e)
         }
     }
-}
