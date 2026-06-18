@@ -1462,19 +1462,21 @@ class OpenAIApiServer(
             ctx.contentType("text/event-stream")
             val writer: java.io.PrintWriter = ctx.res().writer
             
-            // Explicitly named arguments resolve the overload ambiguity
+            // Explicitly named arguments to resolve overload ambiguity
             val job: kotlinx.coroutines.Job? = model.generateStream(
                 prompt = prompt,
                 maxTokens = 100, 
                 temperature = 0.7f,
                 onToken = { chunk: String ->
-                    // Build JSON safely inside the lambda
-                    val jsonMap = mapOf(
-                        "choices" to listOf(mapOf("delta" to mapOf("content" to chunk)))
-                    )
+                    // 1. Build the map using explicit types
+                    val deltaMap = mapOf("content" to chunk)
+                    val choiceMap = mapOf("delta" to deltaMap)
+                    val jsonMap = mapOf("choices" to listOf(choiceMap))
+                    
+                    // 2. Convert to JSON safely
                     val json = gson.toJson(jsonMap)
                     
-                    // Correctly call write on the writer object
+                    // 3. Perform the write operation inside the lambda
                     writer.write("data: $json\n\n")
                     writer.flush()
                 }
