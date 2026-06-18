@@ -46,9 +46,9 @@ class ApiServerService : Service() {
         const val EXTRA_MODEL_PATH = "model_path"
     }
     
-    inner class LocalBinder : Binder() {
-        fun getService(): ApiServerService = this@ApiServerService
-    }
+class LocalBinder(private val service: ApiServerService) : Binder() {
+    fun getService(): ApiServerService = service
+}
     
     override fun onCreate() {
         super.onCreate()
