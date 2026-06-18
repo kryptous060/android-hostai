@@ -60,6 +60,9 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.10.0")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+    implementation("org.eclipse.jetty:jetty-server:9.4.48.v20220622")
+    implementation("org.eclipse.jetty:jetty-util:9.4.48.v20220622")
+
     
     // Javalin for HTTP server with Java 8 compatibility
     implementation("io.javalin:javalin:4.6.8")
