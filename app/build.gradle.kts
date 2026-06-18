@@ -1,5 +1,5 @@
 plugins {
-    id("com.android.application")
+    id("com.android.application") version "8.6.0" // <-- Update made here
     id("org.jetbrains.kotlin.android")
 }
 
@@ -28,9 +28,10 @@ android {
     }
     
     compileOptions {
-        isCoreLibraryDesugaringEnabled = true // Add this line
+        isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8    }
+        targetCompatibility = JavaVersion.VERSION_1_8    
+    }
     
     kotlinOptions {
         jvmTarget = "1.8"
