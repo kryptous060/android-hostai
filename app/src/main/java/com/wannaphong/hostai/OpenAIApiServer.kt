@@ -1489,3 +1489,4 @@ class OpenAIApiServer(
             LogManager.e("OpenAIApiServer", "Error during streaming response", e)
         }
     }
+}
