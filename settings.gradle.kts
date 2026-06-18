@@ -16,5 +16,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "HostAI"
-include(":app"
-)
+include(":app")
