@@ -82,9 +82,7 @@ dependencies {
     // Coroutines for async operations
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     
-    // LiteRT for LLM inference (updated to 0.10.1)
-    implementation("com.google.ai.edge.litertlm:litertlm-android:0.10.1")
-    
+    implementation("com.google.ai.edge.litertlm:litertlm-android:latest.release")    
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
