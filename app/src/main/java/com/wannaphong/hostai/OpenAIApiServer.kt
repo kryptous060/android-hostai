@@ -1457,10 +1457,13 @@ class OpenAIApiServer(
      */
     private suspend fun handleChatStreamingResponse(ctx: JavalinContext, messages: List<Map<String, Any>>) {
         try {
-            val prompt = buildContentsFromMessages(messages)
+            // FIX 1: Add .toString() to force the result into a String
+            val prompt = buildContentsFromMessages(messages).toString()
             
             ctx.contentType("text/event-stream")
-            val writer: java.io.PrintWriter = ctx.res().writer
+            
+            // FIX 2: Use getWriter() as a function call instead of the .writer property
+            val writer: java.io.PrintWriter = ctx.res().getWriter()
             
             // Explicitly pass named arguments to resolve overload ambiguity
             val job: kotlinx.coroutines.Job? = model.generateStream(
