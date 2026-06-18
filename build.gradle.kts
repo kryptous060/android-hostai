@@ -5,8 +5,8 @@ buildscript {
         mavenCentral()
     }
     dependencies {
-        // Updated from 8.5.2 to 8.6.0 to fix the D8 compiler metadata error
-        classpath("com.android.tools.build:gradle:8.6.0")
+        // Upgraded to 8.7.0 to align with Gradle 8.7 and support Kotlin 2.2.0 metadata
+        classpath("com.android.tools.build:gradle:8.7.0")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.0")
     }
 }
