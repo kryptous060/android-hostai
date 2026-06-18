@@ -96,13 +96,13 @@ class OpenAIApiServer(
             // request (and requests after idle periods) do not pay the cost of
             // thread creation on Android.  This is the primary fix for the
             // 5-10 second latency seen when the server appears "slow to start".
-            val threadPool = QueuedThreadPool(JETTY_MAX_THREADS, JETTY_MIN_THREADS, JETTY_IDLE_TIMEOUT_MS)
+                        val threadPool = QueuedThreadPool(JETTY_MAX_THREADS, JETTY_MIN_THREADS, JETTY_IDLE_TIMEOUT_MS)
             threadPool.isDaemon = true
             threadPool.name = "hostai-jetty"
             
             app = Javalin.create { config ->
                 // Assign the pre-warmed thread pool to Jetty
-                config.jetty.threadPool(threadPool) 
+                config.server { Server(threadPool) }
                 
                 // Configure Javalin
                 config.maxRequestSize = MAX_REQUEST_BODY_SIZE.toLong()
