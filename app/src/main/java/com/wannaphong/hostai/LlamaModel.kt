@@ -205,16 +205,15 @@ class LlamaModel(
     /**
      * Initialise the LiteRT engine from a real file-system path.
      */
-    private fun loadFromPath(enginePath: String): Boolean {
+        private fun loadFromPath(enginePath: String): Boolean {
         return try {
             LogManager.i(TAG, "Initializing LiteRT with model: $modelName")
 
-            // Get backend preference from settings
-            val backend = when (settingsManager.getBackend()) {
+            // 1. Get backend preference from settings with explicit type declaration
+            val backend: Backend = when (settingsManager.getBackend()) {
                 SettingsManager.BACKEND_NPU -> {
                     LogManager.i(TAG, "Using NPU backend for inference")
-                    val nativeLibDir = context.applicationInfo.nativeLibraryDir
-                    backend = Backend.NPU(nativeLibraryDir = nativeLibDir)
+                    Backend.NPU(nativeLibraryDir = context.applicationInfo.nativeLibraryDir)
                 }
                 SettingsManager.BACKEND_GPU -> {
                     LogManager.i(TAG, "Using GPU backend for inference")
@@ -230,39 +229,29 @@ class LlamaModel(
             val maxContextLength = settingsManager.getMaxContextLength()
             LogManager.i(TAG, "Using max context length: $maxContextLength tokens")
 
-            // Compiled-kernel cache directory: speeds up subsequent model loads by reusing
-            // pre-compiled GPU/NPU kernels instead of recompiling them on every launch.
+            // Compiled-kernel cache directory
             val cacheDirFile = File(context.cacheDir, "litert_cache")
             if (!cacheDirFile.exists() && !cacheDirFile.mkdirs()) {
                 LogManager.w(TAG, "Failed to create LiteRT cache directory; compiled kernels will not be cached")
             }
             val cacheDir = cacheDirFile.absolutePath
 
-            // Create engine config with selected backend.
-            // Only add vision/audio backends for multimodal models (e.g. Gemma-3N).
-            // Text-only models fail with "Unsupported or unknown file format" when
-            // these backends are specified.
-            // Create engine config with selected backend.
-            // Only add vision/audio backends for multimodal models (e.g. Gemma-3N).
-            // Text-only models fail with "Unsupported or unknown file format" when
-            // these backends are specified.
-            // Create engine config with selected backend.
-            // Only add vision/audio backends for multimodal models (e.g. Gemma-3N / Gemma-4).
+            // 2. Create engine config with the properly typed backend
             val useMultimodal = settingsManager.isMultimodalEnabled()
             val engineConfig = if (useMultimodal) {
-                LogManager.i(TAG, "Multimodal mode enabled: forcing text processing to NPU and vision tasks to GPU")
+                LogManager.i(TAG, "Multimodal mode enabled: forcing text processing to NPU/Selected backend and vision tasks to GPU")
                 EngineConfig(
                     modelPath = enginePath,
-                    backend = backend,              // <--- Uses the NPU backend you just assigned!
+                    backend = backend,
                     maxNumTokens = maxContextLength,
                     cacheDir = cacheDir,
-                    visionBackend = Backend.GPU(),  // <--- Forces vision vectors to GPU to prevent crashes
+                    visionBackend = Backend.GPU(),
                     audioBackend = Backend.CPU()
                 )
             } else {
                 EngineConfig(
                     modelPath = enginePath,
-                    backend = backend,              // <--- Uses the NPU backend you just assigned!
+                    backend = backend,
                     maxNumTokens = maxContextLength,
                     cacheDir = cacheDir
                 )
