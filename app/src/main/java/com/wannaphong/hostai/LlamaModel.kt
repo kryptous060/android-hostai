@@ -245,15 +245,21 @@ class LlamaModel(
             // Only add vision/audio backends for multimodal models (e.g. Gemma-3N).
             // Text-only models fail with "Unsupported or unknown file format" when
             // these backends are specified.
+            // Create engine config with selected backend.
+            // Only add vision/audio backends for multimodal models (e.g. Gemma-3N / Gemma-4).
             val useMultimodal = settingsManager.isMultimodalEnabled()
             val engineConfig = if (useMultimodal) {
-                LogManager.i(TAG, "Multimodal mode enabled: adding vision (GPU) and audio (CPU) backends")
+                LogManager.i(TAG, "Multimodal mode enabled: forcing text processing to NPU and vision tasks to GPU")
+                
+                // Explicitly pull the native library path for Snapdragon NPU driver mapping
+                val nativeLibDir = context.applicationInfo.nativeLibraryDir
+                
                 EngineConfig(
                     modelPath = enginePath,
-                    backend = backend,
+                    backend = Backend.NPU(nativeLibraryDir = nativeLibDir), // Directs primary LLM text context to NPU
                     maxNumTokens = maxContextLength,
                     cacheDir = cacheDir,
-                    visionBackend = Backend.GPU(),
+                    visionBackend = Backend.GPU(), // Routes multimodal vision matrix tasks to GPU to prevent crashes
                     audioBackend = Backend.CPU()
                 )
             } else {
