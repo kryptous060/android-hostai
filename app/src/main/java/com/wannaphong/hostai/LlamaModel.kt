@@ -241,6 +241,10 @@ class LlamaModel(
             // Only add vision/audio backends for multimodal models (e.g. Gemma-3N).
             // Text-only models fail with "Unsupported or unknown file format" when
             // these backends are specified.
+            // Create engine config with selected backend.
+            // Only add vision/audio backends for multimodal models (e.g. Gemma-3N).
+            // Text-only models fail with "Unsupported or unknown file format" when
+            // these backends are specified.
             val useMultimodal = settingsManager.isMultimodalEnabled()
             val engineConfig = if (useMultimodal) {
                 LogManager.i(TAG, "Multimodal mode enabled: adding vision (GPU) and audio (CPU) backends")
