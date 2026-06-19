@@ -33,10 +33,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_11    
     }
     
-    // Modern Kotlin compiler configuration (replaces deprecated jvmTarget)
+    // Modern Kotlin compiler configuration matching JVM target compatibility
     kotlin {
         compilerOptions {
-            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
             // Tells Kotlin 2.1.0 to safely ignore the Kotlin 2.3.0 metadata version warning
             freeCompilerArgs.add("-Xskip-metadata-version-check")
         }
