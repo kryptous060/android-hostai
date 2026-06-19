@@ -213,7 +213,8 @@ class LlamaModel(
             val backend = when (settingsManager.getBackend()) {
                 SettingsManager.BACKEND_NPU -> {
                     LogManager.i(TAG, "Using NPU backend for inference")
-                    Backend.NPU(nativeLibraryDir = context.applicationInfo.nativeLibraryDir)
+                    val nativeLibDir = context.applicationInfo.nativeLibraryDir
+                    backend = Backend.NPU(nativeLibraryDir = nativeLibDir)
                 }
                 SettingsManager.BACKEND_GPU -> {
                     LogManager.i(TAG, "Using GPU backend for inference")
@@ -250,22 +251,18 @@ class LlamaModel(
             val useMultimodal = settingsManager.isMultimodalEnabled()
             val engineConfig = if (useMultimodal) {
                 LogManager.i(TAG, "Multimodal mode enabled: forcing text processing to NPU and vision tasks to GPU")
-                
-                // Explicitly pull the native library path for Snapdragon NPU driver mapping
-                val nativeLibDir = context.applicationInfo.nativeLibraryDir
-                
                 EngineConfig(
                     modelPath = enginePath,
-                    backend = Backend.NPU(nativeLibraryDir = nativeLibDir), // Directs primary LLM text context to NPU
+                    backend = backend,              // <--- Uses the NPU backend you just assigned!
                     maxNumTokens = maxContextLength,
                     cacheDir = cacheDir,
-                    visionBackend = Backend.GPU(), // Routes multimodal vision matrix tasks to GPU to prevent crashes
+                    visionBackend = Backend.GPU(),  // <--- Forces vision vectors to GPU to prevent crashes
                     audioBackend = Backend.CPU()
                 )
             } else {
                 EngineConfig(
                     modelPath = enginePath,
-                    backend = backend,
+                    backend = backend,              // <--- Uses the NPU backend you just assigned!
                     maxNumTokens = maxContextLength,
                     cacheDir = cacheDir
                 )
